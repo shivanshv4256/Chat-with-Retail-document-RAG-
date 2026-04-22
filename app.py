@@ -18,12 +18,10 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 # CONFIG
 # -------------------------------
 
-# 🔐 Set your API key safely
 os.environ["GOOGLE_API_KEY"] = ""
 
 app = FastAPI()
 
-# ✅ Enable CORS (only once)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -46,6 +44,27 @@ vectorstore = None
 
 
 # -------------------------------
+# RETAIL FILTERS
+# -------------------------------
+
+RETAIL_KEYWORDS = [
+    "retail", "store", "inventory", "sales", "customer",
+    "product", "pricing", "supply chain", "shopping",
+    "ecommerce", "pos", "merchandise",
+    "sku", "checkout", "order", "warehouse", "discount"
+]
+
+
+def is_retail_document_keyword(text: str) -> bool:
+    text_lower = text.lower()
+    matches = sum(1 for keyword in RETAIL_KEYWORDS if keyword in text_lower)
+    return matches >= 5
+
+
+
+
+
+# -------------------------------
 # UPLOAD PDF
 # -------------------------------
 
@@ -64,22 +83,33 @@ async def upload_document(file: UploadFile = File(...)):
     loader = PyPDFLoader(file_path)
     docs = loader.load()
 
-    # Split text
+    # Full text
+    full_text = " ".join([doc.page_content for doc in docs])
+
+    # ✅ Combined filter (fast + smart)
+    if  not is_retail_document_keyword(full_text) :
+        os.remove(file_path)
+        return {"message": "Only retail-related documents are allowed"}
+
+    # Split into chunks
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=1000,
         chunk_overlap=200
     )
     chunks = splitter.split_documents(docs)
 
-    # Create embeddings
+    # Embeddings
     embeddings = HuggingFaceEmbeddings(
         model_name="sentence-transformers/all-MiniLM-L6-v2"
     )
 
-    # Create vector DB
-    vectorstore = FAISS.from_documents(chunks, embeddings)
+    # Vector DB (append instead of overwrite)
+    if vectorstore is None:
+        vectorstore = FAISS.from_documents(chunks, embeddings)
+    else:
+        vectorstore.add_documents(chunks)
 
-    # Save metadata
+    # Store metadata
     documents_store.append({
         "id": file_id,
         "name": file.filename,
@@ -103,6 +133,7 @@ async def get_documents():
 # -------------------------------
 # ASK QUESTION (RAG)
 # -------------------------------
+
 @app.post("/ask")
 async def ask_question(request: QueryRequest):
     global vectorstore
@@ -117,9 +148,8 @@ async def ask_question(request: QueryRequest):
 
         query = request.query
 
-        # 🔍 Get MORE context (important)
+        # Retrieve context
         docs = vectorstore.similarity_search(query, k=5)
-
         context = "\n\n".join([doc.page_content for doc in docs])
 
         llm = ChatGoogleGenerativeAI(
@@ -127,15 +157,19 @@ async def ask_question(request: QueryRequest):
             temperature=0.3
         )
 
-        # 🧠 Smart prompt (NO blocking)
         prompt = f"""
-You are an intelligent assistant.
+You are a strict Retail Intelligence Assistant.
 
-Instructions:
-- Use the context to answer the question.
-- If the answer is partially available, give the best possible answer.
-- If not clearly available, still try to provide a helpful response based on context.
-- Keep answer clear and relevant.
+RULES (MANDATORY):
+1. Answer ONLY if the question is related to retail domain 
+   (sales, stores, inventory, customers, products, pricing, supply chain, ecommerce, POS).
+2. Answer ONLY using the provided context.
+3. Use outside knowledge provided in Document.
+4. If answer not found, say:
+   "Answer not available in the provided retail document."
+5. If not retail question, say:
+   "This question is outside the retail domain."
+
 
 Context:
 {context}
